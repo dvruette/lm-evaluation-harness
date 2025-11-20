@@ -1,8 +1,9 @@
+import copy
 import json
+import logging
 import os
-from configparser import ConfigParser
+import warnings
 from functools import lru_cache
-from pathlib import Path
 from typing import Any, Dict, List, NamedTuple, Optional, Tuple, Type, cast
 
 from tqdm import tqdm
@@ -10,7 +11,11 @@ from tqdm import tqdm
 from lm_eval.api.instance import Instance
 from lm_eval.api.model import LM
 from lm_eval.api.registry import register_model
-from lm_eval.utils import eval_logger, simple_parse_args_string
+from lm_eval.models.api_models import JsonChatStr
+from lm_eval.utils import simple_parse_args_string
+
+
+eval_logger = logging.getLogger(__name__)
 
 
 class LogLikelihoodResult(NamedTuple):
@@ -18,57 +23,91 @@ class LogLikelihoodResult(NamedTuple):
     is_greedy: bool
 
 
-@lru_cache(maxsize=None)
-def get_watsonx_credentials(
-    env_name: str = "YP_QA",
-    config_path: str = "config.ini",
-) -> Dict[str, str]:
+def _verify_credentials(creds: dict) -> None:
     """
-    Retrieves Watsonx API credentials from environmental variables or from a configuration file.
-    Args:
-        env_name (str, optional): The name of the environment from which to retrieve credentials. Defaults to "YP_QA".
-        config_path (str, optional): The file path to the `config.ini` configuration file. Defaults to "config.ini".
-    Returns:
-        dict[str, str]: A dictionary containing the credentials necessary for authentication, including
-                        keys such as `apikey`, `url`, and `project_id`.
-    Raises:
-        FileNotFoundError: If the specified configuration file does not exist.
-        AssertionError: If the credentials format is invalid.
+    Validate credentials for APIClient authentication.
+
+    Required conditions:
+    - Either ("username" and "password") or "apikey" must be present.
+    - "url" is mandatory.
+    - Either "project_id" or "space_id" must be present.
     """
-
-    def _verify_credentials(creds: Any) -> None:
-        assert isinstance(creds, dict) and all(
-            key in creds.keys() for key in ["apikey", "url", "project_id"]
-        ), "Wrong configuration for credentials."
-
-    credentials = {
-        "apikey": os.getenv("WATSONX_API_KEY", None),
-        "url": os.getenv("WATSONX_URL", None),
-        "project_id": os.getenv("WATSONX_PROJECT_ID", None),
+    env_var_map = {
+        "apikey": "WATSONX_API_KEY",
+        "token": "WATSONX_TOKEN",
+        "url": "WATSONX_URL",
+        "project_id": "WATSONX_PROJECT_ID",
+        "space_id": "WATSONX_SPACE_ID",
+        "username": "WATSONX_USERNAME",
+        "password": "WATSONX_PASSWORD",
     }
 
-    if any(credentials.get(key) is None for key in ["apikey", "url", "project_id"]):
-        eval_logger.warning(
-            "One or more required environment variables are missing, trying to load config.ini file."
+    # Check authentication: Either ("username" and "password") or "apikey" must be provided
+    has_auth = all(creds.get(key) for key in ["username", "password"]) or creds.get(
+        "apikey"
+    )
+    # Check required fields: "url" must be present
+    has_url = "url" in creds and creds["url"]
+    # Check project/space ID requirement: Either "project_id" or "space_id" must be present
+    has_project_or_space_id = any(creds.get(key) for key in ["project_id", "space_id"])
+
+    if not (has_auth and has_url and has_project_or_space_id):
+        missing_keys = []
+        if not has_auth:
+            missing_keys.append(
+                f"either ('username' and 'password') or 'apikey' ({env_var_map['apikey']})"
+            )
+        if not has_url:
+            missing_keys.append(f"url ({env_var_map['url']})")
+        if not has_project_or_space_id:
+            missing_keys.append(
+                f"either 'project_id' ({env_var_map['project_id']}) or 'space_id' ({env_var_map['space_id']})"
+            )
+
+        error_msg = f"Missing required credentials: {', '.join(missing_keys)}. "
+        error_msg += "Please set the environment variables indicated in parentheses."
+        raise ValueError(error_msg)
+
+
+@lru_cache(maxsize=None)
+def get_watsonx_credentials() -> Dict[str, str]:
+    """
+    Retrieves Watsonx API credentials from environmental variables.
+    Returns:
+        Dict[str, str]: A dictionary containing the credentials necessary for authentication, including
+                        keys such as `apikey` or `token`, `url`, and `project_id`.
+    Raises:
+        AssertionError: If the credentials format is invalid or any of the necessary credentials are missing.
+    """
+    try:
+        from dotenv import load_dotenv
+    except ImportError:
+        raise ImportError(
+            "Could not import dotenv: Please install lm_eval[ibm_watsonx_ai] package."
         )
 
-        config_path = "config.ini" if not config_path else config_path
+    # This function attempts to load a file named .env starting from the CWD and working backwards
+    # towards root. KV pairs are parsed and stored as env vars iff not already set
+    load_dotenv()
 
-        if not Path(config_path).is_absolute():
-            config_path = os.path.join(
-                Path(__file__).parent.parent.absolute(), config_path
-            )
+    credentials = {
+        "username": os.getenv("WATSONX_USERNAME", None),
+        "password": os.getenv("WATSONX_PASSWORD", None),
+        "apikey": os.getenv("WATSONX_API_KEY", None),
+        "token": os.getenv("WATSONX_TOKEN", None),
+        "url": os.getenv("WATSONX_URL", None),
+        "project_id": os.getenv("WATSONX_PROJECT_ID", None),
+        "space_id": os.getenv("WATSONX_SPACE_ID", None),
+    }
+    if "cloud.ibm.com" not in credentials["url"]:
+        credentials["instance_id"] = "openshift"
 
-        if not os.path.exists(config_path):
-            raise FileNotFoundError(
-                f"Provided config file path {config_path} does not exist. "
-                "You need to specify credentials in config.ini file under specified location."
-            )
-
-        config = ConfigParser()
-        config.read(config_path)
-        credentials = json.loads(config.get(env_name))
-
+    if all(credentials.get(key) for key in ["username", "password", "apikey"]):
+        warnings.warn(
+            "You're passing `username`, `password`, and `apikey` at the same time, "
+            "which might cause issues. More info on authentication in different scenarios "
+            "can be found in the docs: https://ibm.github.io/watsonx-ai-python-sdk/setup_cpd.html"
+        )
     _verify_credentials(credentials)
     return credentials
 
@@ -84,7 +123,7 @@ class WatsonxLLM(LM):
     def create_from_arg_string(
         cls: Type["WatsonxLLM"],
         arg_string: str,
-        config_path: Optional[str] = None,
+        additional_config: Optional[Dict] = None,
     ) -> "WatsonxLLM":
         """
         Allow the user to specify model parameters (TextGenerationParameters) in CLI arguments.
@@ -97,9 +136,14 @@ class WatsonxLLM(LM):
             )
 
         args = simple_parse_args_string(arg_string)
+        args.update(additional_config)
+
         model_id = args.pop("model_id", None)
-        if model_id is None:
-            raise ValueError("'model_id' is required, please pass it in 'model_args'")
+        deployment_id = args.pop("deployment_id", None)
+        if model_id is None and deployment_id is None:
+            raise ValueError(
+                "'model_id' or 'deployment_id' is required, please pass it in 'model_args'"
+            )
 
         if not args.get("do_sample", None):
             args["temperature"] = None
@@ -107,7 +151,7 @@ class WatsonxLLM(LM):
             args["top_k"] = None
             args["seed"] = None
 
-        cls.generate_params = {
+        generate_params = {
             GenParams.DECODING_METHOD: (
                 "greedy" if not args.get("do_sample", None) else "sample"
             ),
@@ -130,13 +174,12 @@ class WatsonxLLM(LM):
             },
         }
 
-        generate_params = {
-            k: v for k, v in cls.generate_params.items() if v is not None
-        }
+        generate_params = {k: v for k, v in generate_params.items() if v is not None}
 
         return cls(
-            watsonx_credentials=get_watsonx_credentials(config_path),
+            watsonx_credentials=get_watsonx_credentials(),
             model_id=model_id,
+            deployment_id=deployment_id,
             generate_params=generate_params,
         )
 
@@ -144,6 +187,7 @@ class WatsonxLLM(LM):
         self,
         watsonx_credentials: Dict,
         model_id,
+        deployment_id,
         generate_params: Optional[Dict[Any, Any]] = None,
     ) -> None:
         try:
@@ -156,9 +200,8 @@ class WatsonxLLM(LM):
         super().__init__()
         client = APIClient(watsonx_credentials)
         project_id = watsonx_credentials.get("project_id", None)
-        deployment_id = watsonx_credentials.get("deployment_id", None)
         client.set.default_project(project_id)
-        self.generate_params = generate_params or {}
+        self.generate_params = generate_params
         self.model = ModelInference(
             model_id=model_id,
             deployment_id=deployment_id,
@@ -220,9 +263,9 @@ class WatsonxLLM(LM):
         """
         Calculates the log likelihood of the generated tokens compared to the context tokens.
         Args:
-            input_tokens (List[dict[str, float]]): A List of token dictionaries, each containing
+            input_tokens (List[Dict[str, float]]): A List of token dictionaries, each containing
                 token information like `text` and `logprob`.
-            context_tokens (List[dict[str, float]]): A List of token dictionaries representing
+            context_tokens (List[Dict[str, float]]): A List of token dictionaries representing
                 the input context.
         Returns:
             LogLikelihoodResult: An object containing the calculated log likelihood and a boolean
@@ -252,27 +295,29 @@ class WatsonxLLM(LM):
         Returns:
             List[str]: A List of generated responses.
         """
-        requests = [request.args[0] for request in requests]
+        requests = [request.args for request in requests]
         results = []
-        batch_size = 5
 
-        for i in tqdm(
-            range(0, len(requests), batch_size),
-            desc=f"Running generate_until function with batch size {batch_size}",
+        for request in tqdm(
+            requests,
+            desc="Running generate_until function ...",
         ):
-            batch = requests[i : i + batch_size]
+            context, continuation = request
             try:
-                responses = self.model.generate_text(batch, self.generate_params)
-
+                if isinstance(context, JsonChatStr):
+                    context = json.loads(context.prompt)
+                    response = self.model.chat(context, self.generate_params)
+                    response = response["choices"][0]["message"]["content"]
+                else:
+                    response = self.model.generate_text(context, self.generate_params)
             except Exception as exp:
-                eval_logger.error(f"Error while generating text {exp}")
-                continue
+                eval_logger.error("Error while generating text.")
+                raise exp
 
-            for response, context in zip(responses, batch):
-                results.append(response)
-                self.cache_hook.add_partial("generated_text", context, response)
-
-            eval_logger.info("Cached responses")
+            results.append(response)
+            self.cache_hook.add_partial(
+                "generate_until", (context, continuation), response
+            )
 
         return results
 
@@ -284,7 +329,7 @@ class WatsonxLLM(LM):
                 2. a target string on which the loglikelihood of the LM producing this target,
                    conditioned on the input, will be returned.
         Returns:
-            tuple (loglikelihood, is_greedy) for each request according to the input order:
+            Tuple (loglikelihood, is_greedy) for each request according to the input order:
                 loglikelihood: probability of generating the target string conditioned on the input
                 is_greedy: True if and only if the target string would be generated by greedy sampling from the LM
         """
@@ -295,54 +340,48 @@ class WatsonxLLM(LM):
                 "Could not import ibm_watsonx_ai: Please install lm_eval[ibm_watsonx_ai] package."
             )
         self._check_model_logprobs_support()
-        self.generate_params[GenParams.MAX_NEW_TOKENS] = 1
+        generate_params = copy.copy(self.generate_params)
+        generate_params[GenParams.MAX_NEW_TOKENS] = 1
 
         requests = [request.args for request in requests]
         results: List[LogLikelihoodResult] = []
-        batch_size = 5
 
-        for i in tqdm(
-            range(0, len(requests), batch_size),
-            desc=f"Running loglikelihood function with batch size {batch_size}",
+        # Note: We're not using batching due to (current) indeterminism of loglikelihood values when sending batch of requests
+        for request in tqdm(
+            requests,
+            desc="Running loglikelihood function ...",
         ):
-            batch = requests[i : i + batch_size]
+            context, continuation = request
             try:
-                tokenized_contexts = [
-                    self.model.tokenize(prompt=context, return_tokens=True)["result"][
-                        "tokens"
-                    ]
-                    for context, _ in batch
-                ]
+                tokenized_context = self.model.tokenize(
+                    prompt=context, return_tokens=True
+                )["result"]["tokens"]
             except Exception as exp:
-                eval_logger.error(f"Error while model tokenize:\n {exp}")
-                continue
+                eval_logger.error("Error while model tokenize.")
+                raise exp
 
-            input_prompts = [context + continuation for context, continuation in batch]
+            input_prompt = context + continuation
 
             try:
-                responses = self.model.generate_text(
-                    prompt=input_prompts, params=self.generate_params, raw_response=True
+                response = self.model.generate_text(
+                    prompt=input_prompt, params=generate_params, raw_response=True
                 )
             except Exception as exp:
-                eval_logger.error(f"Error while model generate text:\n {exp}")
-                continue
+                eval_logger.error("Error while model generate text.")
+                raise exp
 
-            for response, tokenized_context, (context, continuation) in zip(
-                responses, tokenized_contexts, batch
-            ):
-                log_likelihood_response = self._get_log_likelihood(
-                    response["results"][0]["input_tokens"], tokenized_context
-                )
-                results.append(log_likelihood_response)
-                self.cache_hook.add_partial(
-                    "loglikelihood",
-                    (context, continuation),
-                    (
-                        log_likelihood_response.log_likelihood,
-                        log_likelihood_response.is_greedy,
-                    ),
-                )
-            eval_logger.info("Cached batch")
+            log_likelihood_response = self._get_log_likelihood(
+                response["results"][0]["input_tokens"], tokenized_context
+            )
+            results.append(log_likelihood_response)
+            self.cache_hook.add_partial(
+                "loglikelihood",
+                (context, continuation),
+                (
+                    log_likelihood_response.log_likelihood,
+                    log_likelihood_response.is_greedy,
+                ),
+            )
 
         return cast(List[Tuple[float, bool]], results)
 
@@ -350,10 +389,10 @@ class WatsonxLLM(LM):
         """
         Used to evaluate perplexity on a data distribution.
         Args:
-            requests: Each request contains Instance.args : tuple[str] containing an input string to the model whose
+            requests: Each request contains Instance.args : Tuple[str] containing an input string to the model whose
                 entire loglikelihood, conditioned on purely the EOT token, will be calculated.
         Returns:
-            tuple (loglikelihood,) for each request according to the input order:
+            Tuple (loglikelihood,) for each request according to the input order:
                 loglikelihood: solely the probability of producing each piece of text given no starting input.
         """
         try:
@@ -363,47 +402,44 @@ class WatsonxLLM(LM):
                 "Could not import ibm_watsonx_ai: Please install lm_eval[ibm_watsonx_ai] package."
             )
         self._check_model_logprobs_support()
-        self.generate_params[GenParams.MAX_NEW_TOKENS] = 1
+        generate_params = copy.deepcopy(self.generate_params)
+        generate_params[GenParams.MAX_NEW_TOKENS] = 1
 
-        requests = [request.args[0] for request in requests]
+        requests = [request.args for request in requests]
         results: List[LogLikelihoodResult] = []
-        batch_size = 5
 
-        for i in tqdm(
-            range(0, len(requests), batch_size),
-            desc=f"Running loglikelihood_rolling function with batch size {batch_size}",
+        # Note: We're not using batching due to (current) indeterminism of loglikelihood values when sending batch of requests
+        for request in tqdm(
+            requests,
+            desc="Running loglikelihood_rolling function ...",
         ):
-            batch = requests[i : i + batch_size]
-
+            context, continuation = request
             try:
-                responses = self.model.generate_text(
-                    prompt=batch, params=self.generate_params, raw_response=True
+                response = self.model.generate_text(
+                    prompt=context, params=generate_params, raw_response=True
                 )
             except Exception as exp:
-                eval_logger.error(f"Error while model generate text:\n {exp}")
-                continue
+                eval_logger.error("Error while model generate text.")
+                raise exp
 
-            for response, context in zip(responses, batch):
-                try:
-                    log_likelihood_response = self._get_log_likelihood(
-                        response["results"][0]["input_tokens"], []
-                    )
-                    results.append(log_likelihood_response)
-
-                    self.cache_hook.add_partial(
-                        "loglikelihood_rolling",
-                        context,
-                        (
-                            log_likelihood_response.log_likelihood,
-                            log_likelihood_response.is_greedy,
-                        ),
-                    )
-                except Exception as exp:
-                    eval_logger.error(
-                        f"Error during log likelihood calculation:\n {exp}"
-                    )
-                    continue
-
-            eval_logger.info("Cached batch")
+            log_likelihood_response = self._get_log_likelihood(
+                response["results"][0]["input_tokens"], []
+            )
+            results.append(log_likelihood_response)
+            self.cache_hook.add_partial(
+                "loglikelihood_rolling",
+                (context, continuation),
+                log_likelihood_response.log_likelihood,
+            )
 
         return cast(List[Tuple[float, bool]], results)
+
+    @property
+    def tokenizer_name(self) -> str:
+        return ""
+
+    def apply_chat_template(
+        self, chat_history: List[Dict[str, str]]
+    ) -> List[Dict[str, str]]:
+        # A hack similar from api_model to allow encoding for cache
+        return JsonChatStr(json.dumps(chat_history))

@@ -1,4 +1,5 @@
 import collections
+import logging
 import math
 import pathlib
 import sys
@@ -7,11 +8,15 @@ from typing import List, Optional, Tuple, Union
 from lm_eval.api.group import ConfigurableGroup
 from lm_eval.api.metrics import (
     aggregate_subtask_metrics,
+    mean,
     pooled_sample_stderr,
     stderr_for_metric,
 )
 from lm_eval.api.task import Task
-from lm_eval.utils import eval_logger, positional_deprecated
+from lm_eval.utils import positional_deprecated
+
+
+eval_logger = logging.getLogger(__name__)
 
 
 class TaskOutput:
@@ -99,7 +104,12 @@ class TaskOutput:
 
     def calculate_aggregate_metric(self, bootstrap_iters=100000) -> None:
         for (metric, filter_key), items in self.sample_metrics.items():
-            agg_fn = self.task.aggregation()[metric]
+            try:
+                agg_fn = self.task.aggregation()[metric]
+            except KeyError:
+                # This is when process results output an arbitrary metric
+                # TODO: Handle this better and allow other aggregate functions other than mean.
+                agg_fn = mean
             metric_key = f"{metric},{filter_key}"
             self.agg_metrics[metric_key] = agg_fn(items)
             self.sample_len = len(items)  # TODO: same sample size for each metric?
@@ -499,6 +509,22 @@ def consolidate_group_results(
                 group_metadata = group_config.get("metadata", None)
                 if group_metadata is not None:
                     versions[group_or_task] = group_metadata.get("version", None)
+
+            # Clean up duplicate score rows for subtasks that also report other metrics.
+            for task in task_list:
+                task_metrics = [
+                    key
+                    for key in results[task].keys()
+                    if "," in key and not key.startswith("score_stderr")
+                ]
+                score_metrics = [
+                    key for key in task_metrics if key.startswith("score,")
+                ]
+                if score_metrics and len(task_metrics) > len(score_metrics):
+                    for score_metric in score_metrics:
+                        results[task].pop(score_metric, None)
+                        stderr_key = score_metric.replace("score,", "score_stderr,")
+                        results[task].pop(stderr_key, None)
     # print(results)
     return results, versions, show_group_table, task_aggregation_list
 
