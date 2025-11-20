@@ -29,7 +29,6 @@ class GiddModel(LM):
         model_path: str,
         num_samples: int = 32,
         completion_only: bool = False,
-        likelihood_method: Literal["loss", "elbo"] = "elbo",
         device: Union[str, torch.device] | None = None,
         batch_size: str | int = 1,
         **kwargs,
