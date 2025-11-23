@@ -1,23 +1,19 @@
-import functools
-import os
 import random
 import logging
 from typing import Literal
 
-from tqdm import tqdm
+import easydel as ed
+import jax
+import jax.experimental.multihost_utils as mh
+import tqdm.auto as tqdm
+
+from gidd_easydel.loading import load_checkpoint
+from gidd_easydel.sampling import generate
+from gidd_easydel.likelihood import likelihood
 
 from lm_eval.api.model import LM
 from lm_eval.api.registry import register_model
-from typing import Union
 from lm_eval.utils import simple_parse_args_string
-
-import torch
-import torch.distributed as dist
-
-from gidd.utils import parse_dtype
-from gidd.loss import get_loss
-from gidd.checkpoints import load_checkpoint
-from gidd.likelihood import ELBO, compute_elbo, compute_causal_nll
 
 
 logger = logging.getLogger(__name__)
@@ -26,77 +22,67 @@ logger = logging.getLogger(__name__)
 class GiddModel(LM):
     def __init__(
         self,
-        model_path: str,
-        num_samples: int = 32,
-        completion_only: bool = False,
-        device: Union[str, torch.device] | None = None,
+        checkpoint_dir: str,
+        num_layers: int,
+        hidden_size: int,
+        num_attn_heads: int,
+        hybrid_mixing_shift: float,
+        prior_distribution: Literal["mask", "uniform"],
+        max_sequence_length: int = 2048,
+        sharding: str = "1,-1,1,1,1",
+        num_denoising_steps: int = 128,
+        min_completion_length: int = 128,
+        max_completion_length: int = 128,
+        noise_schedule: Literal["linear", "cosine"] = "cosine",
+        sampler: Literal["ancestral", "adaptive"] = "adaptive",
+        top_k: int = 1,
+        temperature: float = 0.0,
         batch_size: str | int = 1,
+        seed: int = 0,
+        completion_only: bool = False,
         **kwargs,
     ) -> None:
-        # super init
         super().__init__()
 
+        num_procs = jax.process_count()
+        num_local_devices = jax.local_device_count()
+        num_devices = jax.device_count()
+        logger.info("Process count: %d, local device count: %d, process index: %d, global device count: %d",
+                num_procs, num_local_devices, jax.process_index(), num_devices)
+        
+        self.is_main_process = jax.process_index() == 0
+
         # attributes
-        self.model_path = model_path
-        self.completion_only = completion_only
-        self.num_samples = num_samples
+        self.checkpoint_dir = checkpoint_dir
+        self.max_sequence_length = int(max_sequence_length)
+        self.hybrid_mixing_shift = float(hybrid_mixing_shift)
+        self.prior_distribution = prior_distribution
+        self.noise_schedule = noise_schedule
+        self.sampler = sampler
+        self.top_k = int(top_k)
+        self.temperature = float(temperature)
+        self.num_denoising_steps = int(num_denoising_steps)
+        self.min_completion_length = int(min_completion_length)
+        self.max_completion_length = int(max_completion_length)
         self.batch_size = int(batch_size)
-        self.device = torch.device(device) if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.seed = int(seed)
+        self.completion_only = completion_only
+        
+        sharding_axis_dims = [int(s) for s in sharding.split(",")]
+        self.mesh, self.module, self.tokenizer, self.dtype = load_checkpoint(
+            checkpoint_dir,
+            num_layers=int(num_layers),
+            hidden_size=int(hidden_size),
+            num_attn_heads=int(num_attn_heads),
+            max_seq_len=self.max_sequence_length,
+            sharding_axis_dims=sharding_axis_dims,
+        )
+
+        self.rng = random.Random(self.seed)
 
         if self.completion_only:
             raise NotImplementedError("completion_only is not supported")
 
-        if "LOCAL_RANK" in os.environ:
-            self._rank = int(os.environ["LOCAL_RANK"])
-            self._world_size = int(os.environ["WORLD_SIZE"])
-            dist.init_process_group(backend="nccl", rank=self.rank, world_size=self.world_size)
-            torch.cuda.set_device(self.rank)
-            self.device = torch.device("cuda", self.rank)
-
-        # print the model path
-        logger.info(f"[RANK: {self.rank}] Loading model from {model_path}")
-
-        # # torch stuff
-        # torch.set_float32_matmul_precision('high')
-
-        # load the model
-        model, noise_schedule, tokenizer, config = load_checkpoint(model_path, device=self.device)
-        model.eval()
-        tokenizer.truncation_side = "left"
-        tokenizer.padding_side = "right"
-
-        self.config = config
-        self.model = model
-        self.tokenizer = tokenizer
-        self.dtype = parse_dtype(self.config.training.dtype)
-
-        # parse the dtype the model was trained in
-        self.dtype = parse_dtype(self.config.training.dtype)
-
-        # construct the likelihood estimator
-        if config.model.type == "autoregressive":
-            model = torch.compile(model)
-            self.nll_func = functools.partial(
-                compute_causal_nll,
-                model,
-                return_token_nlls=True,
-            )
-        else:
-            loss_fn = get_loss(config, tokenizer, noise_schedule)
-            likelihood = ELBO(config, model, noise_schedule, loss_fn)
-            likelihood = likelihood.to(self.device)
-
-            # compile for better efficiency
-            self.likelihood = torch.compile(likelihood)
-
-            self.nll_func = functools.partial(
-                compute_elbo,
-                self.likelihood,
-                num_samples=self.num_samples,  # number of inner samples in the estimator, higher number has lower bias and variance
-                t_eps=self.config.model.get("t_eps", 1e-5),  # time epsilong for the noise schedule
-                show_progress=False,  # turn on/off the progress bar
-                return_token_nlls=True,  # set to True to return the token-level nlls
-            )
 
     @classmethod
     def create_from_arg_string(cls, arg_string, additional_config=None):
@@ -106,86 +92,129 @@ class GiddModel(LM):
             args = additional_config
         args.update(simple_parse_args_string(arg_string))
         return cls(**args)
-    
-    def prepare_tokens(self, xs, ys):
-        texts = [x + y for x, y in zip(xs, ys)]
-        batch = self.tokenizer(texts, padding="max_length", truncation=True, max_length=self.config.model.max_seq_len, return_tensors="pt")
-        if batch["input_ids"].shape[1] > self.config.model.max_seq_len:
-            batch["input_ids"] = batch["input_ids"][:, :self.config.model.max_seq_len]
-        batch["loss_mask"] = batch["attention_mask"]
-        return batch
+
+    def generate_until(self, requests, disable_tqdm: bool = False):
+        res = []
+
+        # logger.info(requests[0])
+
+        stop_sequences = requests[0].args[1].get("until", [])
+
+        # first_iteration = False
+
+        # res = [f"#### {i}\n" for i in range(len(requests))]
+        # return res
+
+        strings = [r.args[0] for r in requests]
+        batched = [strings[i:i + self.batch_size] for i in range(0, len(strings), self.batch_size)]
+        with tqdm.tqdm(total=len(batched) * self.batch_size, disable=disable_tqdm or not self.is_main_process) as pbar:
+            for batch in batched:
+                bs = len(batch)
+                if bs < self.batch_size:
+                    # pad to make sure we keep the same shape
+                    batch += [""] * (self.batch_size - bs)
+
+                seed_i = self.rng.randint(0, 2**32 - 1)
+
+                # if first_iteration:
+                #     logger.info(batch[0])
+
+                completions = generate(
+                    self.mesh,
+                    self.module,
+                    self.tokenizer,
+                    prompts=batch,
+                    hybrid_mixing_shift=self.hybrid_mixing_shift,
+                    prior=self.prior_distribution,
+                    num_denoising_steps=self.num_denoising_steps,
+                    max_sequence_length=self.max_sequence_length,
+                    min_completion_length=self.min_completion_length,
+                    max_completion_length=self.max_completion_length,
+                    noise_schedule=self.noise_schedule,
+                    sampler=self.sampler,
+                    top_k=self.top_k,
+                    temperature=self.temperature,
+                    seed=seed_i,
+                    show_progress=False,
+                )
+
+                for i in range(bs):
+                    for stop_seq in stop_sequences:
+                        if stop_seq in completions[i]:
+                            completions[i] = completions[i].split(stop_seq)[0]
+                    res.append(completions[i])
+
+                # if first_iteration:
+                #     logger.info(completions[0])
+                #     first_iteration = False
+
+                pbar.update(self.batch_size)
+
+        return res
 
     def loglikelihood(self, requests, disable_tqdm: bool = False):
         res = []
-        
-        # create the batches input
+
         strings = [(r.args[0], r.args[1]) for r in requests]
         batched = [strings[i:i + self.batch_size] for i in range(0, len(strings), self.batch_size)]
-        for batch in tqdm(batched, disable=disable_tqdm):
-            # load a batch
-            bs = len(batch)
-            if bs < self.batch_size:
-                # pad to make sure we keep the same shape
-                batch += [("", "")] * (self.batch_size - bs)
-            # batch = self.tokenizer(batch, return_tensors="pt", padding="max_length", truncation=True, max_length=self.config.model.max_seq_len)
-            batch = self.prepare_tokens(*zip(*batch))
-            batch = batch.to(self.device)
+        with tqdm.tqdm(total=len(batched) * self.batch_size, disable=disable_tqdm or not self.is_main_process) as pbar:
+            for batch in batched:
+                bs = len(batch)
+                if bs < self.batch_size:
+                    # pad to make sure we keep the same shape
+                    batch += [("", "")] * (self.batch_size - bs)
 
-            with torch.no_grad(), torch.autocast(self.device.type, self.dtype):
-                _, token_nlls = self.nll_func(batch)
+                seed_i = self.rng.randint(0, 2**32 - 1)
 
-                # shape of token_nlls: (batch_size, max_seq_len)
-                # also includes NLL for padding tokens, can be masked like this:
-                if self.completion_only:
-                    loss_mask = batch["loss_mask"][..., :token_nlls.size(-1)]
-                else:
-                    loss_mask = batch["attention_mask"][..., :token_nlls.size(-1)]
-                nll = (token_nlls * loss_mask).sum(dim=-1) / loss_mask.sum(dim=-1)
+                prompts = [b[0] for b in batch]
+                completions = [b[1] for b in batch]
 
-                # remove batch padding
-                ll = -nll[:bs]
-                is_greedy = True
-                for x in ll.cpu().numpy():
-                    res.append((x, is_greedy))
-        
-        return res
+                metrics = likelihood(
+                    self.mesh,
+                    self.module,
+                    self.tokenizer,
+                    prompts=prompts,
+                    completions=completions,
+                    hybrid_mixing_shift=self.hybrid_mixing_shift,
+                    prior=self.prior_distribution,
+                    num_denoising_steps=self.num_denoising_steps,
+                    max_sequence_length=self.max_sequence_length,
+                    noise_schedule="linear",
+                    seed=seed_i,
+                    show_progress=False,
+                )
 
-    def generate_until(self, requests, disable_tqdm: bool = False):
-        raise NotImplementedError("generate_until is not implemented for semantic_diffusion")
-        res = []
+                for i in range(bs):
+                    log_likelihood = -metrics["total_nll"][i].item()
+                    is_greedy = False  # impossible to tell
+                    answer = (log_likelihood, is_greedy)
+                    res.append(answer)
 
-        for request in tqdm(requests, disable=disable_tqdm):
-            res.append("lol")
-            assert request.arguments[0].strip() != ""
+                pbar.update(self.batch_size)
 
         return res
 
     def loglikelihood_rolling(self, requests, disable_tqdm: bool = False):
-        raise NotImplementedError("loglikelihood_rolling is not implemented for semantic_diffusion")
+        raise NotImplementedError("loglikelihood_rolling is not implemented for GiddModel")
         res = []
 
-        for _ in tqdm(requests, disable=disable_tqdm):
+        for _ in tqdm.tqdm(requests, disable=disable_tqdm):
             res.append(-random.random())
 
         return res
 
     @property
     def accelerator(self):
-        return self._Accelerator(self.world_size)
+        return self._Accelerator()
 
     class _Accelerator:
-        def __init__(self, world_size):
-            self.world_size = world_size
-
         def wait_for_everyone(self):
-            dist.barrier()
+            # sync devices
+            mh.sync_global_devices()
 
         def gather(self, local_tensor):
-            gathered_tensors = [
-                torch.zeros_like(local_tensor)
-                for _ in range(self.world_size)
-            ]
-            dist.all_gather(gathered_tensors, local_tensor)
-            if local_tensor.dim() < 1:
-                return torch.stack(gathered_tensors)
-            return torch.cat(gathered_tensors)
+            # input: local tensor of shape (N, ...)
+            # output: tensor of shape (world_size * N, ...)
+            # edge case where local tensor is a scalar: output shape (world_size,)
+            # ==> jax already handles this for us
+            return local_tensor
